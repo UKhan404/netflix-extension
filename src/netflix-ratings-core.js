@@ -6,13 +6,7 @@
   }
 
   var STORAGE_KEYS = {
-    awsAccessKeyId: 'nro.imdb.awsAccessKeyId',
-    awsSecretAccessKey: 'nro.imdb.awsSecretAccessKey',
-    awsSessionToken: 'nro.imdb.awsSessionToken',
-    imdbApiKey: 'nro.imdb.apiKey',
-    datasetId: 'nro.imdb.datasetId',
-    revisionId: 'nro.imdb.revisionId',
-    assetId: 'nro.imdb.assetId'
+    omdbApiKey: 'nro.omdbApiKey'
   };
 
   var DETAIL_ROOT_SELECTOR = '.previewModal--wrapper, .previewModal--container, .jawBone, .billboard-row, main';
@@ -47,7 +41,7 @@
 
   function createApp(env) {
     var state = {
-      config: null,
+      omdbApiKey: null,
       cache: new Map(),
       inFlight: new Map(),
       scanTimer: null,
@@ -82,7 +76,7 @@
     async function init() {
       injectStyles();
       registerMenuCommands();
-      state.config = await loadConfig();
+      state.omdbApiKey = await mergedEnv.getValue(STORAGE_KEYS.omdbApiKey);
       wireNavigation();
       observeDom();
       scanSoon();
@@ -93,12 +87,12 @@
         return;
       }
 
-      mergedEnv.registerMenuCommand('Netflix Ratings: Configure IMDb API', function () {
-        promptForConfig();
+      mergedEnv.registerMenuCommand('Netflix Ratings: Set OMDb API key', function () {
+        promptForApiKey();
       });
 
-      mergedEnv.registerMenuCommand('Netflix Ratings: Clear IMDb API config', async function () {
-        await clearConfig();
+      mergedEnv.registerMenuCommand('Netflix Ratings: Clear OMDb API key', async function () {
+        await saveApiKey('');
       });
     }
 
@@ -153,8 +147,8 @@
     }
 
     async function scanPage() {
-      if (!hasFullConfig()) {
-        renderSetupPanel(buildMissingConfigMessage());
+      if (!state.omdbApiKey) {
+        renderSetupPanel('Add your OMDb API key to show IMDb ratings next to Netflix titles in the detail view.');
         clearBadges();
         return;
       }
@@ -176,7 +170,7 @@
           return;
         }
 
-        var title = cleanTitle(titleNode.textContent);
+        var title = extractCleanTitle(titleNode);
         if (!title) {
           return;
         }
@@ -215,7 +209,7 @@
 
       if (result.error) {
         mount.dataset.nroStatus = 'error';
-        renderUnavailable(mount, result.error);
+        renderUnavailable(mount, result.error, result.imdbUrl);
         return;
       }
 
@@ -236,23 +230,58 @@
 
       var task = (async function () {
         try {
-          var searchResponse = await requestImdbGraphql(buildSearchQuery(title));
-          var candidates = extractSearchCandidates(searchResponse);
-          if (!candidates.length) {
-            return unavailableResult(title, 'IMDb title search returned no matches.');
+          var searchData = await mergedEnv.requestJson({
+            url: buildOmdbUrl({
+              s: title
+            })
+          });
+
+          if (searchData && searchData.Response === 'False') {
+            if (isApiKeyError(searchData.Error)) {
+              return unavailableResult(title, searchData.Error);
+            }
+            return unavailableResult(title, 'No OMDb title match was found.');
           }
 
+          var candidates = Array.isArray(searchData.Search) ? searchData.Search : [];
           var bestMatch = pickBestMatch(candidates, title);
-          if (!bestMatch || !bestMatch.id) {
-            return unavailableResult(title, 'No close IMDb title match was found.');
+          if (!bestMatch || !bestMatch.imdbID) {
+            return unavailableResult(title, 'No close OMDb title match was found.');
           }
 
-          var ratingResponse = await requestImdbGraphql(buildRatingQuery(bestMatch.id));
-          var rating = extractRatingResponse(ratingResponse, bestMatch, title);
-          state.cache.set(queryKey, rating);
-          return rating;
+          var detailData = await mergedEnv.requestJson({
+            url: buildOmdbUrl({
+              i: bestMatch.imdbID
+            })
+          });
+
+          if (detailData && detailData.Response === 'False') {
+            if (isApiKeyError(detailData.Error)) {
+              return unavailableResult(title, detailData.Error, {
+                imdbUrl: 'https://www.imdb.com/title/' + encodeURIComponent(bestMatch.imdbID) + '/'
+              });
+            }
+            return unavailableResult(title, 'OMDb returned no IMDb rating for this title.', {
+              imdbUrl: 'https://www.imdb.com/title/' + encodeURIComponent(bestMatch.imdbID) + '/'
+            });
+          }
+
+          var rating = detailData.imdbRating && detailData.imdbRating !== 'N/A'
+            ? detailData.imdbRating
+            : null;
+
+          var result = {
+            title: detailData.Title || title,
+            imdbId: detailData.imdbID || bestMatch.imdbID,
+            imdbUrl: 'https://www.imdb.com/title/' + encodeURIComponent(detailData.imdbID || bestMatch.imdbID) + '/',
+            imdbRating: rating,
+            error: rating ? null : 'OMDb did not provide an IMDb rating for this title.'
+          };
+
+          state.cache.set(queryKey, result);
+          return result;
         } catch (error) {
-          return unavailableResult(title, error && error.message ? error.message : 'IMDb lookup failed.');
+          return unavailableResult(title, error && error.message ? error.message : 'OMDb lookup failed.');
         } finally {
           state.inFlight.delete(queryKey);
         }
@@ -262,73 +291,17 @@
       return task;
     }
 
-    function requestImdbGraphql(query) {
-      return mergedEnv.requestJson({
-        kind: 'imdbGraphql',
-        query: query
+    function buildOmdbUrl(params) {
+      var url = new URL('https://www.omdbapi.com/');
+      url.searchParams.set('apikey', state.omdbApiKey);
+
+      Object.keys(params).forEach(function (key) {
+        if (params[key]) {
+          url.searchParams.set(key, String(params[key]));
+        }
       });
-    }
 
-    function buildSearchQuery(title) {
-      return [
-        'query {',
-        '  mainSearch(',
-        '    first: 5',
-        '    options: {',
-        '      searchTerm: "' + escapeGraphqlString(title) + '"',
-        '      isExactMatch: false',
-        '      type: TITLE',
-        '    }',
-        '  ) {',
-        '    edges {',
-        '      node {',
-        '        entity {',
-        '          ... on Title {',
-        '            id',
-        '            titleText {',
-        '              text',
-        '            }',
-        '          }',
-        '        }',
-        '      }',
-        '    }',
-        '  }',
-        '}'
-      ].join('\n');
-    }
-
-    function buildRatingQuery(titleId) {
-      return [
-        'query {',
-        '  title(id: "' + escapeGraphqlString(titleId) + '") {',
-        '    id',
-        '    titleText {',
-        '      text',
-        '    }',
-        '    ratingsSummary {',
-        '      aggregateRating',
-        '      voteCount',
-        '    }',
-        '  }',
-        '}'
-      ].join('\n');
-    }
-
-    function extractSearchCandidates(response) {
-      var edges = response &&
-        response.data &&
-        response.data.mainSearch &&
-        Array.isArray(response.data.mainSearch.edges)
-        ? response.data.mainSearch.edges
-        : [];
-
-      return edges
-        .map(function (edge) {
-          var entity = edge && edge.node ? edge.node.entity : null;
-          var text = entity && entity.titleText ? entity.titleText.text : null;
-          return entity && entity.id && text ? { id: entity.id, title: text } : null;
-        })
-        .filter(Boolean);
+      return url.toString();
     }
 
     function pickBestMatch(candidates, desiredTitle) {
@@ -338,7 +311,7 @@
         .map(function (candidate) {
           return {
             candidate: candidate,
-            score: scoreTitle(candidate.title, normalizedDesired)
+            score: scoreTitle(candidate.Title, normalizedDesired)
           };
         })
         .sort(function (left, right) {
@@ -380,47 +353,25 @@
       return overlap;
     }
 
-    function extractRatingResponse(response, bestMatch, fallbackTitle) {
-      var titleData = response && response.data ? response.data.title : null;
-      var ratingsSummary = titleData ? titleData.ratingsSummary : null;
-
-      if (!titleData || !ratingsSummary || ratingsSummary.aggregateRating == null) {
-        return unavailableResult(fallbackTitle, 'IMDb returned no rating for this title.', {
-          imdbId: bestMatch.id,
-          imdbUrl: 'https://www.imdb.com/title/' + encodeURIComponent(bestMatch.id) + '/'
-        });
-      }
-
-      return {
-        title: titleData.titleText && titleData.titleText.text ? titleData.titleText.text : fallbackTitle,
-        imdbId: titleData.id || bestMatch.id,
-        imdbUrl: 'https://www.imdb.com/title/' + encodeURIComponent(titleData.id || bestMatch.id) + '/',
-        aggregateRating: ratingsSummary.aggregateRating,
-        voteCount: ratingsSummary.voteCount || null,
-        error: null
-      };
-    }
-
     function unavailableResult(title, error, seed) {
       return Object.assign({
         title: title,
         imdbId: null,
         imdbUrl: 'https://www.imdb.com/find/?q=' + encodeURIComponent(title),
-        aggregateRating: null,
-        voteCount: null,
+        imdbRating: null,
         error: error
       }, seed || {});
     }
 
     function ensureMount(titleNode) {
-      var existing = titleNode.querySelector(':scope > .nro-imdb-host');
-      if (existing) {
-        return existing;
+      var sibling = titleNode.nextElementSibling;
+      if (sibling && sibling.classList.contains('nro-imdb-host')) {
+        return sibling;
       }
 
       var mount = document.createElement('span');
       mount.className = 'nro-imdb-host';
-      titleNode.appendChild(mount);
+      titleNode.insertAdjacentElement('afterend', mount);
       return mount;
     }
 
@@ -436,32 +387,30 @@
     function renderRating(mount, rating) {
       mount.replaceChildren();
 
+      if (!rating.imdbRating) {
+        renderUnavailable(mount, rating.error || 'IMDb rating unavailable.', rating.imdbUrl);
+        return;
+      }
+
       var badge = document.createElement('a');
       badge.className = 'nro-imdb-badge';
       badge.href = rating.imdbUrl;
       badge.target = '_blank';
       badge.rel = 'noreferrer';
-      badge.textContent = 'IMDb ' + String(rating.aggregateRating);
-
-      if (rating.voteCount) {
-        badge.title = 'IMDb rating based on ' + Number(rating.voteCount).toLocaleString() + ' votes';
-      }
-
+      badge.textContent = 'IMDb ' + String(rating.imdbRating);
       mount.appendChild(badge);
     }
 
-    function renderUnavailable(mount, errorMessage) {
+    function renderUnavailable(mount, errorMessage, imdbUrl) {
       mount.replaceChildren();
 
-      var badge = document.createElement('button');
-      badge.type = 'button';
+      var badge = document.createElement('a');
       badge.className = 'nro-imdb-badge nro-imdb-badge-muted';
+      badge.href = imdbUrl || '#';
+      badge.target = '_blank';
+      badge.rel = 'noreferrer';
       badge.textContent = 'IMDb n/a';
       badge.title = errorMessage;
-      badge.addEventListener('click', function () {
-        promptForConfig();
-      });
-
       mount.appendChild(badge);
     }
 
@@ -495,17 +444,17 @@
         var configureButton = document.createElement('button');
         configureButton.type = 'button';
         configureButton.className = 'nro-setup-button';
-        configureButton.textContent = 'Configure IMDb API';
+        configureButton.textContent = 'Add OMDb key';
         configureButton.addEventListener('click', function () {
-          promptForConfig();
+          promptForApiKey();
         });
 
         var docsLink = document.createElement('a');
-        docsLink.href = 'https://developer.imdb.com/documentation/api-documentation/getting-access/';
+        docsLink.href = 'https://www.omdbapi.com/apikey.aspx';
         docsLink.target = '_blank';
         docsLink.rel = 'noreferrer';
         docsLink.className = 'nro-setup-link';
-        docsLink.textContent = 'IMDb API docs';
+        docsLink.textContent = 'Get OMDb key';
 
         copy.appendChild(title);
         copy.appendChild(text);
@@ -531,129 +480,37 @@
       state.setupPanel = null;
     }
 
-    async function promptForConfig() {
-      var current = state.config || {};
-      var fields = [
-        {
-          key: 'awsAccessKeyId',
-          label: 'AWS Access Key ID',
-          optional: false
-        },
-        {
-          key: 'awsSecretAccessKey',
-          label: 'AWS Secret Access Key',
-          optional: false
-        },
-        {
-          key: 'awsSessionToken',
-          label: 'AWS Session Token (optional)',
-          optional: true
-        },
-        {
-          key: 'imdbApiKey',
-          label: 'IMDb API key (x-api-key)',
-          optional: false
-        },
-        {
-          key: 'datasetId',
-          label: 'AWS Data Exchange data-set-id',
-          optional: false
-        },
-        {
-          key: 'revisionId',
-          label: 'AWS Data Exchange revision-id',
-          optional: false
-        },
-        {
-          key: 'assetId',
-          label: 'AWS Data Exchange asset-id',
-          optional: false
-        }
-      ];
-
-      var nextConfig = Object.assign({}, current);
-
-      for (var index = 0; index < fields.length; index += 1) {
-        var field = fields[index];
-        var value = global.prompt(
-          field.label + (field.optional ? '\nLeave blank if not needed.' : ''),
-          nextConfig[field.key] || ''
-        );
-
-        if (value === null) {
-          return;
-        }
-
-        nextConfig[field.key] = value.trim();
-      }
-
-      state.config = normalizeConfig(nextConfig);
-      state.cache.clear();
-      state.inFlight.clear();
-
-      var keys = Object.keys(STORAGE_KEYS);
-      for (var keyIndex = 0; keyIndex < keys.length; keyIndex += 1) {
-        var storageKeyName = keys[keyIndex];
-        await mergedEnv.setValue(STORAGE_KEYS[storageKeyName], state.config[storageKeyName] || '');
-      }
-
-      scanSoon();
-    }
-
-    async function clearConfig() {
-      state.config = normalizeConfig({});
-      state.cache.clear();
-      state.inFlight.clear();
-
-      var keys = Object.keys(STORAGE_KEYS);
-      for (var index = 0; index < keys.length; index += 1) {
-        await mergedEnv.setValue(STORAGE_KEYS[keys[index]], '');
-      }
-
-      scanSoon();
-    }
-
-    async function loadConfig() {
-      var keys = Object.keys(STORAGE_KEYS);
-      var loaded = {};
-
-      for (var index = 0; index < keys.length; index += 1) {
-        var key = keys[index];
-        loaded[key] = await mergedEnv.getValue(STORAGE_KEYS[key]);
-      }
-
-      return normalizeConfig(loaded);
-    }
-
-    function normalizeConfig(config) {
-      return {
-        awsAccessKeyId: config.awsAccessKeyId || '',
-        awsSecretAccessKey: config.awsSecretAccessKey || '',
-        awsSessionToken: config.awsSessionToken || '',
-        imdbApiKey: config.imdbApiKey || '',
-        datasetId: config.datasetId || '',
-        revisionId: config.revisionId || '',
-        assetId: config.assetId || ''
-      };
-    }
-
-    function hasFullConfig() {
-      return Boolean(
-        state.config &&
-        state.config.awsAccessKeyId &&
-        state.config.awsSecretAccessKey &&
-        state.config.imdbApiKey &&
-        state.config.datasetId &&
-        state.config.revisionId &&
-        state.config.assetId
+    async function promptForApiKey() {
+      var response = global.prompt(
+        [
+          'Enter your OMDb API key.',
+          'Get one at https://www.omdbapi.com/apikey.aspx',
+          'Leave blank to remove the saved key.'
+        ].join('\n'),
+        state.omdbApiKey || ''
       );
+
+      if (response === null) {
+        return;
+      }
+
+      await saveApiKey(response.trim());
     }
 
-    function buildMissingConfigMessage() {
-      return [
-        'This version uses the official IMDb API via AWS Data Exchange.',
-        'Configure your AWS Access Key ID, AWS Secret Access Key, IMDb API key, data-set-id, revision-id, and asset-id to show ratings.'
-      ].join(' ');
+    async function saveApiKey(value) {
+      state.omdbApiKey = value || null;
+      state.cache.clear();
+      state.inFlight.clear();
+      await mergedEnv.setValue(STORAGE_KEYS.omdbApiKey, state.omdbApiKey);
+      scanSoon();
+    }
+
+    function extractCleanTitle(titleNode) {
+      var clone = titleNode.cloneNode(true);
+      clone.querySelectorAll('.nro-imdb-host').forEach(function (node) {
+        node.remove();
+      });
+      return cleanTitle(clone.textContent);
     }
 
     function cleanTitle(value) {
@@ -692,11 +549,8 @@
         .trim();
     }
 
-    function escapeGraphqlString(value) {
-      return String(value || '')
-        .replace(/\\/g, '\\\\')
-        .replace(/"/g, '\\"')
-        .replace(/\n/g, '\\n');
+    function isApiKeyError(message) {
+      return /api key|request limit/i.test(String(message || ''));
     }
 
     function injectStyles() {
@@ -725,7 +579,7 @@
 
     return {
       init: init,
-      promptForConfig: promptForConfig
+      promptForApiKey: promptForApiKey
     };
   }
 

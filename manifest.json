@@ -1,13 +1,13 @@
 {
   "manifest_version": 3,
   "name": "Netflix IMDb Ratings Overlay",
-  "version": "0.3.0",
-  "description": "Shows an IMDb rating badge next to the Netflix title in the more-details view using the official IMDb API.",
+  "version": "0.4.0",
+  "description": "Shows an IMDb rating badge next to the Netflix title in the more-details view using OMDb.",
   "permissions": [
     "storage"
   ],
   "host_permissions": [
-    "https://api-fulfill.dataexchange.us-east-1.amazonaws.com/*"
+    "https://www.omdbapi.com/*"
   ],
   "background": {
     "service_worker": "src/background.js"
