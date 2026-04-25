@@ -1,0 +1,30 @@
+{
+  "manifest_version": 3,
+  "name": "Netflix Ratings Overlay",
+  "version": "0.1.0",
+  "description": "Adds IMDb and Rotten Tomatoes ratings to Netflix without removing any Netflix UI.",
+  "permissions": [
+    "storage"
+  ],
+  "host_permissions": [
+    "https://www.omdbapi.com/*"
+  ],
+  "background": {
+    "service_worker": "src/background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.netflix.com/*"
+      ],
+      "js": [
+        "src/netflix-ratings-core.js",
+        "src/content-script.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_title": "Netflix Ratings Overlay"
+  }
+}
