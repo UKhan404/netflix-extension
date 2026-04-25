@@ -1,75 +1,66 @@
-# Netflix Ratings Overlay
+# Netflix IMDb Ratings Overlay
 
-This project gives you two ways to run the same idea on Netflix:
+This project is now a Chrome extension only.
 
-- A Violentmonkey userscript you can install directly.
-- A Chrome extension wrapper you can load unpacked in Chrome.
+It shows a single IMDb rating badge next to the title inside Netflix's detail or more-info views. It does not remove any Netflix UI.
 
-It adds IMDb and Rotten Tomatoes ratings to Netflix and can also add MyDramaList ratings for Asian dramas without removing Netflix UI.
+## What changed
 
-## Folder layout
+- Removed Rotten Tomatoes support.
+- Removed MyDramaList support.
+- Removed the Violentmonkey userscript path.
+- Limited the overlay to Netflix detail views instead of browse cards.
+- Switched the data source to the official IMDb API.
 
-- `violentmonkey/netflix-ratings.user.js`: install this in Violentmonkey.
-- `manifest.json`: Chrome extension manifest.
-- `src/`: shared Chrome extension source files.
+## Official IMDb API requirement
 
-## Important note
+This project uses IMDb's official API through AWS Data Exchange.
 
-Violentmonkey does not install regular Chrome extensions. It installs userscripts.
+IMDb's current official docs say you need:
 
-Because your request mentioned both, this project includes both:
+- An AWS account.
+- AWS access keys.
+- An IMDb API subscription through AWS Data Exchange.
+- Your unique `x-api-key`, `data-set-id`, `revision-id`, and `asset-id`.
 
-- Use the userscript if you want the fastest path inside Violentmonkey.
-- Use the Chrome extension if you want to load it through `chrome://extensions`.
+Official docs:
 
-## Ratings sources
+- [IMDb API getting access](https://developer.imdb.com/documentation/api-documentation/getting-access/)
+- [IMDb API calling the API](https://developer.imdb.com/documentation/api-documentation/calling-the-api/)
 
-- OMDb powers IMDb and Rotten Tomatoes ratings.
-- MyDramaList powers MDL ratings for Asian dramas when a MyDramaList API key is configured.
+The extension prompts you for:
 
-## API keys
+- AWS Access Key ID
+- AWS Secret Access Key
+- AWS Session Token (optional)
+- IMDb API key (`x-api-key`)
+- Data set ID
+- Revision ID
+- Asset ID
 
-This project now supports two optional keys:
+## Security note
 
-- OMDb API key: required for IMDb and Rotten Tomatoes ratings.
-- MyDramaList API key: required for MDL ratings.
+This extension stores your IMDb and AWS credentials in local Chrome extension storage on your machine so it can sign requests directly from the extension background worker.
 
-Official references:
+That is convenient for local development, but it is not the right model for publishing broadly. A production-safe version should move the AWS signing step behind your own backend proxy.
 
-- [OMDb API key request](https://www.omdbapi.com/apikey.aspx)
-- [MyDramaList API reference](https://mydramalist.github.io/MDL-API/)
-
-The MyDramaList docs currently describe the API key header as `mdl-api-key`.
-
-## Install in Violentmonkey
-
-1. Open Violentmonkey and create a new script.
-2. Replace the default contents with the code from `violentmonkey/netflix-ratings.user.js`.
-3. Save the script.
-4. Open Netflix.
-5. Use the on-page setup panel or the Violentmonkey script menu to add your OMDb key and, if you have one, your MyDramaList key.
-
-## Load as a Chrome extension
+## Load in Chrome
 
 1. Open `chrome://extensions`.
 2. Enable `Developer mode`.
 3. Click `Load unpacked`.
-4. Select this project folder:
+4. Select this folder:
    `/Users/umairkhanjadoon/Codex Playground/projects/netflix-extension`
-5. Open Netflix and add your API keys when prompted.
+5. Open Netflix.
+6. Click `Configure IMDb API` in the setup panel and enter your official IMDb API credentials.
 
-## What it does
+## UI behavior
 
-- Injects rating pills into Netflix detail views and visible title cards.
-- Keeps Netflix’s existing layout and only adds extra UI.
-- Shows IMDb and Rotten Tomatoes when OMDb is configured.
-- Shows MyDramaList when a title matches MDL and a MyDramaList key is configured.
-- Limits card lookups to titles near the viewport so the page stays responsive.
-- Stores your API keys locally in Violentmonkey storage or Chrome extension storage.
+- The rating appears only in Netflix detail views.
+- The badge is injected inline next to the title.
+- Clicking the badge opens the matching IMDb title page.
 
 ## Known limitations
 
-- Netflix is a private SPA and its DOM changes over time, so selectors may need maintenance later.
-- OMDb and MyDramaList matching are title-based, so remakes, alternate spellings, and regional titles can still resolve imperfectly.
-- MyDramaList API access depends on having a working MDL developer key.
-- Rotten Tomatoes links point to Rotten Tomatoes search results because OMDb returns the rating but not a stable Rotten Tomatoes title URL.
+- The extension currently matches Netflix titles to IMDb by title search text, so remakes and alternate titles can still mis-match occasionally.
+- Because the extension signs AWS requests locally, this repo is best treated as a personal/local tool rather than a public distributable extension.
