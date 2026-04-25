@@ -15,6 +15,24 @@
     'h1',
     'h2'
   ].join(', ');
+  var DETAIL_MOUNT_SELECTOR = [
+    '.previewModal--detailsMetadata-right > div:first-child',
+    '.previewModal--detailsMetadata > div:first-child',
+    '.previewModal--metadatAndControls-info > div:first-child',
+    '.billboard-info [class*="meta"]',
+    '.billboard-row [class*="meta"]',
+    '.jawBone [class*="meta"]',
+    '.jawBoneContainer [class*="meta"]'
+  ].join(', ');
+  var DETAIL_FALLBACK_SELECTOR = [
+    '.previewModal--metadatAndControls-info',
+    '.previewModal--detailsMetadata',
+    '.previewModal--detailsMetadata-right',
+    '.jawBoneContainer',
+    '.billboard-info',
+    '.billboard-row .info',
+    'main'
+  ].join(', ');
   var TITLE_STOP_WORDS = [
     'play',
     'resume',
@@ -166,18 +184,16 @@
 
       document.querySelectorAll(DETAIL_ROOT_SELECTOR).forEach(function (root) {
         var titleNode = root.querySelector(DETAIL_TITLE_SELECTOR);
-        if (!titleNode) {
-          return;
-        }
-
-        var title = extractCleanTitle(titleNode);
+        var title = extractTitleFromRoot(root, titleNode);
         if (!title) {
           return;
         }
 
-        if (!targetMap.has(titleNode)) {
-          targetMap.set(titleNode, {
+        var anchorNode = titleNode || root.querySelector(DETAIL_MOUNT_SELECTOR) || root;
+        if (!targetMap.has(root)) {
+          targetMap.set(root, {
             root: root,
+            anchorNode: anchorNode,
             titleNode: titleNode,
             title: title
           });
@@ -188,11 +204,15 @@
     }
 
     async function processTarget(target) {
-      if (!target.root.isConnected || !target.titleNode.isConnected) {
+      if (!target.root.isConnected || !target.anchorNode.isConnected) {
         return;
       }
 
-      var mount = ensureMount(target.titleNode);
+      var mount = ensureMount(target);
+      if (!mount) {
+        return;
+      }
+
       var queryKey = normalizeComparable(target.title);
 
       if (mount.dataset.nroQueryKey === queryKey && mount.dataset.nroStatus === 'ready') {
@@ -203,12 +223,12 @@
       renderLoading(mount);
 
       var result = await lookupImdb(target.title);
-      if (!target.titleNode.isConnected || mount.dataset.nroQueryKey !== queryKey) {
+      if (!target.root.isConnected || mount.dataset.nroQueryKey !== queryKey) {
         return;
       }
 
       if (result.error) {
-        mount.dataset.nroStatus = 'error';
+        mount.dataset.nroStatus = 'ready';
         renderUnavailable(mount, result.error, result.imdbUrl);
         return;
       }
@@ -363,19 +383,34 @@
       }, seed || {});
     }
 
-    function ensureMount(titleNode) {
-      var sibling = titleNode.nextElementSibling;
-      if (sibling && sibling.classList.contains('nro-imdb-host')) {
-        return sibling;
+    function ensureMount(target) {
+      var existing = target.root.querySelector('.nro-imdb-host');
+      if (existing) {
+        return existing;
       }
 
+      var mountContainer = target.root.querySelector(DETAIL_MOUNT_SELECTOR);
       var mount = document.createElement('span');
       mount.className = 'nro-imdb-host';
-      titleNode.insertAdjacentElement('afterend', mount);
+      var fallbackContainer = target.root.querySelector(DETAIL_FALLBACK_SELECTOR);
+
+      if (mountContainer) {
+        mountContainer.appendChild(mount);
+      } else if (fallbackContainer && fallbackContainer.parentNode) {
+        fallbackContainer.insertAdjacentElement('afterend', mount);
+      } else if (target.titleNode && target.titleNode.parentNode) {
+        target.titleNode.insertAdjacentElement('afterend', mount);
+      } else if (target.anchorNode && target.anchorNode.parentNode) {
+        target.anchorNode.insertAdjacentElement('afterbegin', mount);
+      } else {
+        target.root.insertAdjacentElement('afterbegin', mount);
+      }
+
       return mount;
     }
 
     function renderLoading(mount) {
+      mount.style.display = 'inline-flex';
       mount.replaceChildren();
 
       var text = document.createElement('span');
@@ -385,6 +420,7 @@
     }
 
     function renderRating(mount, rating) {
+      mount.style.display = 'inline-flex';
       mount.replaceChildren();
 
       if (!rating.imdbRating) {
@@ -402,6 +438,7 @@
     }
 
     function renderUnavailable(mount, errorMessage, imdbUrl) {
+      mount.style.display = 'inline-flex';
       mount.replaceChildren();
 
       var badge = document.createElement('a');
@@ -410,7 +447,7 @@
       badge.target = '_blank';
       badge.rel = 'noreferrer';
       badge.textContent = 'IMDb n/a';
-      badge.title = errorMessage;
+      badge.title = errorMessage || 'IMDb rating not available.';
       mount.appendChild(badge);
     }
 
@@ -505,12 +542,57 @@
       scanSoon();
     }
 
-    function extractCleanTitle(titleNode) {
-      var clone = titleNode.cloneNode(true);
-      clone.querySelectorAll('.nro-imdb-host').forEach(function (node) {
-        node.remove();
+    function extractTitleFromRoot(root, titleNode) {
+      var candidates = [];
+
+      addTitleCandidate(candidates, titleNode ? titleNode.textContent : null, 140);
+      addTitleCandidate(candidates, textFrom(root, '[data-uia*="video-title"]'), 135);
+      addTitleCandidate(candidates, textFrom(root, 'h1'), 130);
+      addTitleCandidate(candidates, textFrom(root, 'h2'), 120);
+      addTitleCandidate(candidates, textFrom(root, 'h3'), 110);
+
+      root.querySelectorAll('img[alt]').forEach(function (image, index) {
+        if (index < 6) {
+          addTitleCandidate(candidates, image.getAttribute('alt'), 100 - index);
+        }
       });
-      return cleanTitle(clone.textContent);
+
+      root.querySelectorAll('[aria-label]').forEach(function (element, index) {
+        if (index < 10) {
+          addTitleCandidate(candidates, element.getAttribute('aria-label'), 80 - index);
+        }
+      });
+
+      root.querySelectorAll('[class*="title"], [class*="Title"], [class*="logo"], [class*="fallback-text"]').forEach(function (element, index) {
+        if (index < 10) {
+          addTitleCandidate(candidates, element.textContent, 90 - index);
+        }
+      });
+
+      addTitleCandidate(candidates, document.querySelector('main h1') && document.querySelector('main h1').textContent, 125);
+
+      candidates.sort(function (left, right) {
+        return right.score - left.score;
+      });
+
+      return candidates.length ? candidates[0].title : null;
+    }
+
+    function addTitleCandidate(bucket, value, score) {
+      var cleaned = cleanTitle(value);
+      if (!cleaned) {
+        return;
+      }
+
+      bucket.push({
+        title: cleaned,
+        score: score
+      });
+    }
+
+    function textFrom(root, selector) {
+      var node = root.querySelector(selector);
+      return node ? node.textContent : null;
     }
 
     function cleanTitle(value) {
@@ -561,10 +643,11 @@
       var style = document.createElement('style');
       style.id = 'nro-styles';
       style.textContent = [
-        '.nro-imdb-host { display: inline-flex; align-items: center; margin-left: 10px; vertical-align: middle; }',
-        '.nro-imdb-badge { display: inline-flex; align-items: center; border: 0; border-radius: 999px; padding: 4px 9px; font: 700 12px/1 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; text-decoration: none; color: #19160a; background: linear-gradient(135deg, #f6d55b, #f4bf1a); box-shadow: 0 8px 18px rgba(0, 0, 0, 0.22); cursor: pointer; }',
+        '.nro-imdb-host { display: inline-flex; align-items: center; margin-left: 8px; vertical-align: middle; }',
+        '.previewModal--metadatAndControls-info + .nro-imdb-host, .previewModal--detailsMetadata + .nro-imdb-host, .previewModal--detailsMetadata-right + .nro-imdb-host, .jawBoneContainer + .nro-imdb-host, .billboard-info + .nro-imdb-host, .billboard-row .info + .nro-imdb-host { display: flex; margin: 8px 0 0; }',
+        '.nro-imdb-badge { display: inline-flex; align-items: center; border: 0; border-radius: 999px; padding: 2px 8px; font: 700 11px/1 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; text-decoration: none; color: #19160a; background: linear-gradient(135deg, #f6d55b, #f4bf1a); box-shadow: 0 4px 10px rgba(0, 0, 0, 0.16); cursor: pointer; }',
         '.nro-imdb-badge-loading { color: #302608; opacity: 0.9; }',
-        '.nro-imdb-badge-muted { color: #eef2f6; background: rgba(58, 63, 74, 0.92); }',
+        '.nro-imdb-badge-muted { color: rgba(255, 255, 255, 0.92); background: rgba(86, 93, 108, 0.82); box-shadow: none; }',
         '.nro-setup-panel { position: fixed; right: 20px; bottom: 20px; z-index: 999999; max-width: min(430px, calc(100vw - 32px)); padding: 14px 16px; border-radius: 18px; color: #fff; background: linear-gradient(135deg, rgba(18, 24, 34, 0.96), rgba(28, 14, 7, 0.96)); border: 1px solid rgba(255, 255, 255, 0.12); box-shadow: 0 18px 50px rgba(0, 0, 0, 0.45); backdrop-filter: blur(12px); }',
         '.nro-setup-copy { display: flex; flex-direction: column; gap: 6px; margin-bottom: 12px; }',
         '.nro-setup-copy strong { font: 700 14px/1.2 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }',
