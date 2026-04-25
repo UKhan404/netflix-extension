@@ -159,12 +159,17 @@
     }
 
     async function scanPage() {
+      var missingKeysMessage = buildMissingKeysMessage();
       if (!hasAnyApiKey()) {
-        renderSetupPanel('Add an OMDb API key for IMDb and Rotten Tomatoes, and optionally a MyDramaList key for Asian drama ratings.');
+        renderSetupPanel(missingKeysMessage);
         return;
       }
 
-      removeSetupPanel();
+      if (missingKeysMessage) {
+        renderSetupPanel(missingKeysMessage);
+      } else {
+        removeSetupPanel();
+      }
 
       var targets = collectTargets();
       var cardCount = 0;
@@ -1144,6 +1149,22 @@
 
       if (!hasAnyApiKey()) {
         return 'Add an OMDb API key for IMDb and Rotten Tomatoes, and optionally a MyDramaList key for Asian drama ratings.';
+      }
+
+      return null;
+    }
+
+    function buildMissingKeysMessage() {
+      if (!state.omdbApiKey && !state.mdlApiKey) {
+        return 'Add an OMDb API key for IMDb and Rotten Tomatoes, and optionally a MyDramaList key for Asian drama ratings.';
+      }
+
+      if (!state.omdbApiKey) {
+        return 'Add your OMDb API key to enable IMDb and Rotten Tomatoes ratings.';
+      }
+
+      if (!state.mdlApiKey) {
+        return 'Add your MyDramaList API key to enable MDL ratings for Asian dramas.';
       }
 
       return null;
