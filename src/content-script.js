@@ -24,9 +24,9 @@
     });
   }
 
-  function requestJson(url) {
+  function requestJson(request) {
     return new Promise(function (resolve, reject) {
-      chrome.runtime.sendMessage({ type: 'nro:request-json', url: url }, function (response) {
+      chrome.runtime.sendMessage({ type: 'nro:request-json', request: request }, function (response) {
         if (chrome.runtime.lastError) {
           reject(new Error(chrome.runtime.lastError.message));
           return;

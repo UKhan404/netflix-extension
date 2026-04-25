@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Netflix Ratings Overlay
 // @namespace    https://codex.local/netflix-ratings
-// @version      0.1.0
-// @description  Adds IMDb and Rotten Tomatoes ratings to Netflix title cards and detail views.
+// @version      0.2.0
+// @description  Adds IMDb, Rotten Tomatoes, and optional MyDramaList ratings to Netflix title cards and detail views.
 // @match        https://www.netflix.com/*
 // @run-at       document-idle
 // @grant        GM_getValue
@@ -10,6 +10,7 @@
 // @grant        GM_registerMenuCommand
 // @grant        GM_xmlhttpRequest
 // @connect      www.omdbapi.com
+// @connect      api.mydramalist.com
 // ==/UserScript==
 
 (function () {
@@ -21,7 +22,8 @@
     }
 
     var STORAGE_KEYS = {
-      apiKey: 'nro.omdbApiKey'
+      omdbApiKey: 'nro.omdbApiKey',
+      mdlApiKey: 'nro.mdlApiKey'
     };
 
     var CARD_SCAN_LIMIT = 14;
@@ -53,7 +55,8 @@
 
     function createApp(env) {
       var state = {
-        apiKey: null,
+        omdbApiKey: null,
+        mdlApiKey: null,
         cache: new Map(),
         inFlight: new Map(),
         scanTimer: null,
@@ -88,7 +91,8 @@
       async function init() {
         injectStyles();
         registerMenuCommands();
-        state.apiKey = await mergedEnv.getValue(STORAGE_KEYS.apiKey);
+        state.omdbApiKey = await mergedEnv.getValue(STORAGE_KEYS.omdbApiKey);
+        state.mdlApiKey = await mergedEnv.getValue(STORAGE_KEYS.mdlApiKey);
         wireNavigation();
         observeDom();
         scanSoon();
@@ -100,11 +104,19 @@
         }
 
         mergedEnv.registerMenuCommand('Netflix Ratings: Set OMDb API key', function () {
-          promptForApiKey();
+          promptForOmdbApiKey();
         });
 
         mergedEnv.registerMenuCommand('Netflix Ratings: Clear OMDb API key', async function () {
-          await saveApiKey('');
+          await saveOmdbApiKey('');
+        });
+
+        mergedEnv.registerMenuCommand('Netflix Ratings: Set MyDramaList API key', function () {
+          promptForMdlApiKey();
+        });
+
+        mergedEnv.registerMenuCommand('Netflix Ratings: Clear MyDramaList API key', async function () {
+          await saveMdlApiKey('');
         });
       }
 
@@ -145,6 +157,10 @@
         });
       }
 
+      function hasAnyApiKey() {
+        return Boolean(state.omdbApiKey || state.mdlApiKey);
+      }
+
       function scanSoon() {
         if (state.scanTimer) {
           global.clearTimeout(state.scanTimer);
@@ -159,8 +175,8 @@
       }
 
       async function scanPage() {
-        if (!state.apiKey) {
-          renderSetupPanel('Add your OMDb API key to enable IMDb and Rotten Tomatoes ratings.');
+        if (!hasAnyApiKey()) {
+          renderSetupPanel('Add an OMDb API key for IMDb and Rotten Tomatoes, and optionally a MyDramaList key for Asian drama ratings.');
           return;
         }
 
@@ -252,12 +268,12 @@
           return;
         }
 
+        if (result.setupMessage) {
+          renderSetupPanel(result.setupMessage);
+        }
+
         if (result.error) {
           mount.dataset.nroStatus = 'error';
-
-          if (isApiKeyError(result.error)) {
-            renderSetupPanel(result.error);
-          }
 
           if (target.kind === 'detail') {
             renderError(mount, result.error);
@@ -284,38 +300,29 @@
 
         var task = (async function () {
           try {
-            var searchUrl = buildOmdbUrl({
-              s: meta.title,
-              y: meta.year,
-              type: meta.type
-            });
+            var omdbTask = state.omdbApiKey
+              ? lookupOmdb(meta)
+              : Promise.resolve(emptyOmdb(meta.title, false));
+            var mdlTask = state.mdlApiKey
+              ? lookupMdl(meta)
+              : Promise.resolve(emptyMdl(meta.title, false));
 
-            var searchData = await mergedEnv.requestJson(searchUrl);
-            if (searchData && searchData.Response === 'False') {
-              if (isApiKeyError(searchData.Error)) {
-                return { error: searchData.Error };
-              }
-              return emptyRatings(meta.title);
+            var settled = await Promise.all([omdbTask, mdlTask]);
+            var omdbRatings = settled[0];
+            var mdlRatings = settled[1];
+            var combined = combineRatings(meta.title, omdbRatings, mdlRatings);
+
+            if (!combined.hasVisiblePills) {
+              combined.setupMessage = buildSetupMessage(omdbRatings.error, mdlRatings.error);
             }
 
-            var bestMatch = pickBestMatch(searchData && searchData.Search, meta);
-            if (!bestMatch || !bestMatch.imdbID) {
-              return emptyRatings(meta.title);
-            }
-
-            var detailData = await mergedEnv.requestJson(buildOmdbUrl({ i: bestMatch.imdbID }));
-            if (detailData && detailData.Response === 'False') {
-              if (isApiKeyError(detailData.Error)) {
-                return { error: detailData.Error };
-              }
-              return emptyRatings(meta.title);
-            }
-
-            var ratings = normalizeRatings(detailData, meta.title);
-            state.cache.set(queryKey, ratings);
-            return ratings;
+            state.cache.set(queryKey, combined);
+            return combined;
           } catch (error) {
-            return { error: error && error.message ? error.message : 'Lookup failed.' };
+            return {
+              error: error && error.message ? error.message : 'Lookup failed.',
+              setupMessage: buildSetupMessage(error && error.message ? error.message : '')
+            };
           } finally {
             state.inFlight.delete(queryKey);
           }
@@ -325,9 +332,126 @@
         return task;
       }
 
-      function buildOmdbUrl(params) {
+      async function lookupOmdb(meta) {
+        try {
+          var searchData = await requestJson(buildOmdbRequest({
+            s: meta.title,
+            y: meta.year,
+            type: meta.type
+          }));
+
+          if (searchData && searchData.Response === 'False') {
+            if (isOmdbApiKeyError(searchData.Error)) {
+              return Object.assign(emptyOmdb(meta.title, true), {
+                error: searchData.Error
+              });
+            }
+            return emptyOmdb(meta.title, true);
+          }
+
+          var bestMatch = pickBestOmdbMatch(searchData && searchData.Search, meta);
+          if (!bestMatch || !bestMatch.imdbID) {
+            return emptyOmdb(meta.title, true);
+          }
+
+          var detailData = await requestJson(buildOmdbRequest({ i: bestMatch.imdbID }));
+          if (detailData && detailData.Response === 'False') {
+            if (isOmdbApiKeyError(detailData.Error)) {
+              return Object.assign(emptyOmdb(meta.title, true), {
+                error: detailData.Error
+              });
+            }
+            return emptyOmdb(meta.title, true);
+          }
+
+          return normalizeOmdbRatings(detailData, meta.title);
+        } catch (error) {
+          return Object.assign(emptyOmdb(meta.title, true), {
+            error: error && error.message ? error.message : 'OMDb lookup failed.'
+          });
+        }
+      }
+
+      async function lookupMdl(meta) {
+        try {
+          var searchData = await searchMdlTitles(meta.title);
+
+          var bestMatch = pickBestMdlMatch(extractMdlResults(searchData), meta);
+          if (!bestMatch || !bestMatch.id) {
+            return emptyMdl(meta.title, true);
+          }
+
+          var hasSearchDetails = bestMatch.rating != null && bestMatch.permalink;
+          var titleData = hasSearchDetails
+            ? bestMatch
+            : await requestJson({
+              url: 'https://api.mydramalist.com/v1/titles/' + encodeURIComponent(bestMatch.id),
+              headers: {
+                'Content-Type': 'application/json',
+                'mdl-api-key': state.mdlApiKey
+              }
+            });
+
+          if (titleData && titleData.error) {
+            return Object.assign(emptyMdl(meta.title, true), {
+              error: titleData.error
+            });
+          }
+
+          return normalizeMdlRatings(titleData || bestMatch, meta.title);
+        } catch (error) {
+          return Object.assign(emptyMdl(meta.title, true), {
+            error: error && error.message ? error.message : 'MyDramaList lookup failed.'
+          });
+        }
+      }
+
+      async function searchMdlTitles(title) {
+        var jsonHeaders = {
+          'Content-Type': 'application/json',
+          'mdl-api-key': state.mdlApiKey
+        };
+
+        try {
+          var jsonResponse = await requestJson({
+            url: 'https://api.mydramalist.com/v1/search/titles',
+            method: 'POST',
+            headers: jsonHeaders,
+            body: JSON.stringify({
+              q: title
+            })
+          });
+
+          if (extractMdlResults(jsonResponse).length || isMdlApiKeyError(readErrorMessage(jsonResponse))) {
+            return jsonResponse;
+          }
+        } catch (error) {
+          if (isMdlApiKeyError(error && error.message ? error.message : '')) {
+            throw error;
+          }
+        }
+
+        return requestJson({
+          url: 'https://api.mydramalist.com/v1/search/titles',
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
+            'mdl-api-key': state.mdlApiKey
+          },
+          body: 'q=' + encodeURIComponent(title)
+        });
+      }
+
+      function requestJson(request) {
+        if (typeof request === 'string') {
+          return mergedEnv.requestJson({ url: request });
+        }
+        return mergedEnv.requestJson(request);
+      }
+
+      function buildOmdbRequest(params) {
         var url = new URL('https://www.omdbapi.com/');
-        url.searchParams.set('apikey', state.apiKey);
+        url.searchParams.set('apikey', state.omdbApiKey);
 
         Object.keys(params).forEach(function (key) {
           if (params[key]) {
@@ -335,49 +459,100 @@
           }
         });
 
-        return url.toString();
+        return {
+          url: url.toString()
+        };
       }
 
-      function pickBestMatch(results, meta) {
+      function pickBestOmdbMatch(results, meta) {
         if (!Array.isArray(results) || !results.length) {
           return null;
         }
 
         var desiredTitle = normalizeComparable(meta.title);
-
-        return results
+        var ranked = results
           .map(function (result) {
             return {
               result: result,
-              score: scoreResult(result, desiredTitle, meta)
+              score: scoreComparableTitles(
+                [result.Title],
+                desiredTitle,
+                extractYear(result.Year),
+                meta.year,
+                normalizeOmdbType(result.Type),
+                meta.type
+              )
             };
           })
           .sort(function (left, right) {
             return right.score - left.score;
-          })[0].result;
+          });
+
+        return ranked[0].score >= 24 ? ranked[0].result : null;
       }
 
-      function scoreResult(result, desiredTitle, meta) {
-        var score = 0;
-        var actualTitle = normalizeComparable(result.Title);
-
-        if (actualTitle === desiredTitle) {
-          score += 120;
-        } else if (actualTitle.indexOf(desiredTitle) !== -1 || desiredTitle.indexOf(actualTitle) !== -1) {
-          score += 80;
-        } else {
-          score += tokenOverlapScore(actualTitle, desiredTitle);
+      function pickBestMdlMatch(results, meta) {
+        if (!Array.isArray(results) || !results.length) {
+          return null;
         }
 
-        if (meta.type && result.Type === meta.type) {
+        var desiredTitle = normalizeComparable(meta.title);
+        var ranked = results
+          .map(function (result) {
+            var normalized = normalizeMdlRecord(result);
+            return {
+              result: normalized,
+              score: scoreComparableTitles(
+                collectMdlTitles(normalized),
+                desiredTitle,
+                extractYear(normalized.year || normalized.released),
+                meta.year,
+                normalizeMdlType(normalized.type),
+                meta.type
+              )
+            };
+          })
+          .sort(function (left, right) {
+            return right.score - left.score;
+          });
+
+        return ranked[0].score >= 28 ? ranked[0].result : null;
+      }
+
+      function scoreComparableTitles(titleCandidates, desiredTitle, actualYear, expectedYear, actualType, expectedType) {
+        var score = 0;
+        var bestTitleScore = 0;
+
+        titleCandidates.forEach(function (candidate) {
+          var comparable = normalizeComparable(candidate);
+          if (!comparable) {
+            return;
+          }
+
+          var candidateScore = 0;
+          if (comparable === desiredTitle) {
+            candidateScore += 120;
+          } else if (comparable.indexOf(desiredTitle) !== -1 || desiredTitle.indexOf(comparable) !== -1) {
+            candidateScore += 80;
+          } else {
+            candidateScore += tokenOverlapScore(comparable, desiredTitle);
+          }
+
+          if (candidateScore > bestTitleScore) {
+            bestTitleScore = candidateScore;
+          }
+        });
+
+        score += bestTitleScore;
+
+        if (expectedType && actualType && expectedType === actualType) {
           score += 15;
         }
 
-        var resultYear = extractYear(result.Year);
-        if (meta.year && resultYear) {
-          if (meta.year === resultYear) {
+        if (expectedYear && actualYear) {
+          if (expectedYear === actualYear) {
             score += 25;
-          } else if (Math.abs(meta.year - resultYear) === 1) {
+          } else if (Math.abs(expectedYear - actualYear) === 1) {
             score += 10;
           }
         }
@@ -399,7 +574,7 @@
         return overlap;
       }
 
-      function normalizeRatings(detailData, fallbackTitle) {
+      function normalizeOmdbRatings(detailData, fallbackTitle) {
         var imdbRating = detailData.imdbRating && detailData.imdbRating !== 'N/A'
           ? detailData.imdbRating
           : null;
@@ -416,6 +591,7 @@
         var resolvedTitle = detailData.Title || fallbackTitle;
 
         return {
+          sourceConfigured: true,
           title: resolvedTitle,
           imdbId: detailData.imdbID || null,
           imdbRating: imdbRating,
@@ -427,8 +603,61 @@
         };
       }
 
-      function emptyRatings(title) {
+      function normalizeMdlRatings(detailData, fallbackTitle) {
+        var record = normalizeMdlRecord(detailData);
+        var resolvedTitle = record.title || fallbackTitle;
+        var rating = normalizeNumericRating(record.rating);
+
         return {
+          sourceConfigured: true,
+          matched: Boolean(record.id || record.permalink || rating),
+          title: resolvedTitle,
+          mdlId: record.id || null,
+          mdlRating: rating,
+          mdlUrl: record.permalink || ('https://mydramalist.com/search?q=' + encodeURIComponent(resolvedTitle))
+        };
+      }
+
+      function combineRatings(fallbackTitle, omdbRatings, mdlRatings) {
+        var title = omdbRatings.title || mdlRatings.title || fallbackTitle;
+        var hasVisiblePills = Boolean(
+          omdbRatings.sourceConfigured ||
+          mdlRatings.matched
+        );
+
+        return {
+          title: title,
+          omdbEnabled: Boolean(omdbRatings.sourceConfigured),
+          mdlEnabled: Boolean(mdlRatings.sourceConfigured),
+          mdlMatched: Boolean(mdlRatings.matched),
+          imdbId: omdbRatings.imdbId || null,
+          imdbRating: omdbRatings.imdbRating || null,
+          rottenTomatoes: omdbRatings.rottenTomatoes || null,
+          imdbUrl: omdbRatings.imdbUrl || ('https://www.imdb.com/find/?q=' + encodeURIComponent(title)),
+          rottenTomatoesUrl: omdbRatings.rottenTomatoesUrl || ('https://www.rottentomatoes.com/search?search=' + encodeURIComponent(title)),
+          mdlId: mdlRatings.mdlId || null,
+          mdlRating: mdlRatings.mdlRating || null,
+          mdlUrl: mdlRatings.mdlUrl || ('https://mydramalist.com/search?q=' + encodeURIComponent(title)),
+          hasVisiblePills: hasVisiblePills,
+          error: hasVisiblePills ? null : chooseRenderableError(omdbRatings.error, mdlRatings.error)
+        };
+      }
+
+      function chooseRenderableError(omdbError, mdlError) {
+        if (!omdbError && !mdlError) {
+          return null;
+        }
+
+        if (omdbError && mdlError) {
+          return omdbError + ' | ' + mdlError;
+        }
+
+        return omdbError || mdlError;
+      }
+
+      function emptyOmdb(title, configured) {
+        return {
+          sourceConfigured: configured,
           title: title,
           imdbId: null,
           imdbRating: null,
@@ -436,6 +665,98 @@
           imdbUrl: 'https://www.imdb.com/find/?q=' + encodeURIComponent(title),
           rottenTomatoesUrl: 'https://www.rottentomatoes.com/search?search=' + encodeURIComponent(title)
         };
+      }
+
+      function emptyMdl(title, configured) {
+        return {
+          sourceConfigured: configured,
+          matched: false,
+          title: title,
+          mdlId: null,
+          mdlRating: null,
+          mdlUrl: 'https://mydramalist.com/search?q=' + encodeURIComponent(title)
+        };
+      }
+
+      function extractMdlResults(payload) {
+        if (Array.isArray(payload)) {
+          return payload;
+        }
+
+        if (!payload || typeof payload !== 'object') {
+          return [];
+        }
+
+        if (Array.isArray(payload.results)) {
+          return payload.results;
+        }
+
+        if (Array.isArray(payload.data)) {
+          return payload.data;
+        }
+
+        if (Array.isArray(payload.titles)) {
+          return payload.titles;
+        }
+
+        if (Array.isArray(payload.items)) {
+          return payload.items;
+        }
+
+        return [];
+      }
+
+      function normalizeMdlRecord(record) {
+        if (!record || typeof record !== 'object') {
+          return {};
+        }
+
+        if (record.title && typeof record.title === 'object' && !Array.isArray(record.title)) {
+          return Object.assign({}, record.title, {
+            rating: record.rating != null ? record.rating : record.title.rating,
+            permalink: record.permalink || record.title.permalink,
+            id: record.id || record.title.id
+          });
+        }
+
+        return record;
+      }
+
+      function collectMdlTitles(record) {
+        var titles = [];
+        pushUnique(titles, record.title);
+        pushUnique(titles, record.original_title);
+
+        if (Array.isArray(record.alt_titles)) {
+          record.alt_titles.forEach(function (value) {
+            pushUnique(titles, value);
+          });
+        }
+
+        return titles;
+      }
+
+      function pushUnique(bucket, value) {
+        if (!value) {
+          return;
+        }
+
+        if (bucket.indexOf(value) === -1) {
+          bucket.push(value);
+        }
+      }
+
+      function normalizeNumericRating(value) {
+        if (value == null || value === '' || value === 'N/A') {
+          return null;
+        }
+
+        var number = Number(value);
+        if (!Number.isFinite(number) || number <= 0) {
+          return null;
+        }
+
+        return String(number % 1 === 0 ? number.toFixed(1) : number);
       }
 
       function extractTitleMeta(root, kind) {
@@ -480,7 +801,7 @@
         return {
           title: bestTitle,
           year: extractYear(root.textContent),
-          type: extractType(root.textContent)
+          type: extractNetflixType(root.textContent)
         };
       }
 
@@ -540,7 +861,7 @@
         return match ? Number(match[1]) : null;
       }
 
-      function extractType(text) {
+      function extractNetflixType(text) {
         if (!text) {
           return null;
         }
@@ -557,6 +878,34 @@
 
         if (normalized.indexOf('movie') !== -1 || normalized.indexOf('film') !== -1) {
           return 'movie';
+        }
+
+        return null;
+      }
+
+      function normalizeOmdbType(value) {
+        if (!value) {
+          return null;
+        }
+        return String(value).toLowerCase() === 'series' ? 'series' : String(value).toLowerCase() === 'movie' ? 'movie' : null;
+      }
+
+      function normalizeMdlType(value) {
+        if (!value) {
+          return null;
+        }
+
+        var normalized = String(value).toLowerCase();
+        if (normalized.indexOf('movie') !== -1 || normalized.indexOf('film') !== -1) {
+          return 'movie';
+        }
+
+        if (
+          normalized.indexOf('drama') !== -1 ||
+          normalized.indexOf('series') !== -1 ||
+          normalized.indexOf('show') !== -1
+        ) {
+          return 'series';
         }
 
         return null;
@@ -610,20 +959,25 @@
         var wrapper = document.createElement('div');
         wrapper.className = kind === 'detail' ? 'nro-badge-group nro-inline' : 'nro-badge-group nro-compact';
 
-        if (!ratings.imdbRating && !ratings.rottenTomatoes) {
+        if (ratings.omdbEnabled) {
+          wrapper.appendChild(createPill('IMDb', ratings.imdbRating || 'n/a', ratings.imdbUrl, 'imdb'));
+          wrapper.appendChild(createPill('RT', ratings.rottenTomatoes || 'n/a', ratings.rottenTomatoesUrl, 'rt'));
+        }
+
+        if (ratings.mdlMatched || ratings.mdlRating) {
+          wrapper.appendChild(createPill('MDL', ratings.mdlRating || 'n/a', ratings.mdlUrl, 'mdl'));
+        }
+
+        if (!wrapper.children.length) {
           var emptyPill = document.createElement('a');
           emptyPill.className = 'nro-pill nro-pill-muted';
-          emptyPill.href = ratings.imdbUrl;
+          emptyPill.href = ratings.mdlUrl || ratings.imdbUrl || '#';
           emptyPill.target = '_blank';
           emptyPill.rel = 'noreferrer';
           emptyPill.textContent = 'Ratings n/a';
           wrapper.appendChild(emptyPill);
-          mount.appendChild(wrapper);
-          return;
         }
 
-        wrapper.appendChild(createPill('IMDb', ratings.imdbRating || 'n/a', ratings.imdbUrl, 'imdb'));
-        wrapper.appendChild(createPill('RT', ratings.rottenTomatoes || 'n/a', ratings.rottenTomatoesUrl, 'rt'));
         mount.appendChild(wrapper);
       }
 
@@ -636,7 +990,15 @@
         note.textContent = 'Ratings unavailable';
         note.title = message;
         note.addEventListener('click', function () {
-          promptForApiKey();
+          if (state.omdbApiKey) {
+            promptForOmdbApiKey();
+            return;
+          }
+          if (state.mdlApiKey) {
+            promptForMdlApiKey();
+            return;
+          }
+          promptForOmdbApiKey();
         });
 
         mount.appendChild(note);
@@ -673,33 +1035,54 @@
           var actionRow = document.createElement('div');
           actionRow.className = 'nro-setup-actions';
 
-          var actionButton = document.createElement('button');
-          actionButton.type = 'button';
-          actionButton.className = 'nro-setup-button';
-          actionButton.textContent = 'Add OMDb API key';
-          actionButton.addEventListener('click', function () {
-            promptForApiKey();
+          var omdbButton = document.createElement('button');
+          omdbButton.type = 'button';
+          omdbButton.className = 'nro-setup-button';
+          omdbButton.textContent = 'Add OMDb key';
+          omdbButton.addEventListener('click', function () {
+            promptForOmdbApiKey();
           });
 
-          var link = document.createElement('a');
-          link.href = 'https://www.omdbapi.com/apikey.aspx';
-          link.target = '_blank';
-          link.rel = 'noreferrer';
-          link.className = 'nro-setup-link';
-          link.textContent = 'Get a free key';
+          var mdlButton = document.createElement('button');
+          mdlButton.type = 'button';
+          mdlButton.className = 'nro-setup-button nro-setup-button-secondary';
+          mdlButton.textContent = 'Add MDL key';
+          mdlButton.addEventListener('click', function () {
+            promptForMdlApiKey();
+          });
+
+          var linkRow = document.createElement('div');
+          linkRow.className = 'nro-setup-links';
+
+          var omdbLink = document.createElement('a');
+          omdbLink.href = 'https://www.omdbapi.com/apikey.aspx';
+          omdbLink.target = '_blank';
+          omdbLink.rel = 'noreferrer';
+          omdbLink.className = 'nro-setup-link';
+          omdbLink.textContent = 'Get OMDb key';
+
+          var mdlLink = document.createElement('a');
+          mdlLink.href = 'https://mydramalist.github.io/MDL-API/';
+          mdlLink.target = '_blank';
+          mdlLink.rel = 'noreferrer';
+          mdlLink.className = 'nro-setup-link';
+          mdlLink.textContent = 'MDL API docs';
 
           copy.appendChild(title);
           copy.appendChild(text);
-          actionRow.appendChild(actionButton);
-          actionRow.appendChild(link);
+          actionRow.appendChild(omdbButton);
+          actionRow.appendChild(mdlButton);
+          linkRow.appendChild(omdbLink);
+          linkRow.appendChild(mdlLink);
           state.setupPanel.appendChild(copy);
           state.setupPanel.appendChild(actionRow);
+          state.setupPanel.appendChild(linkRow);
           document.body.appendChild(state.setupPanel);
         }
 
         var textNode = state.setupPanel.querySelector('.nro-setup-text');
         if (textNode) {
-          textNode.textContent = message || 'Add your OMDb API key to enable ratings.';
+          textNode.textContent = message || 'Add an OMDb API key and optionally a MyDramaList API key to enable ratings.';
         }
       }
 
@@ -712,26 +1095,82 @@
         state.setupPanel = null;
       }
 
-      async function promptForApiKey() {
+      async function promptForOmdbApiKey() {
         var promptMessage = [
           'Enter your OMDb API key.',
           'Get one at https://www.omdbapi.com/apikey.aspx',
           'Leave blank to remove the saved key.'
         ].join('\n');
 
-        var response = global.prompt(promptMessage, state.apiKey || '');
+        var response = global.prompt(promptMessage, state.omdbApiKey || '');
         if (response === null) {
           return;
         }
 
-        await saveApiKey(response.trim());
+        await saveOmdbApiKey(response.trim());
       }
 
-      async function saveApiKey(value) {
-        state.apiKey = value || null;
-        state.cache.clear();
-        await mergedEnv.setValue(STORAGE_KEYS.apiKey, state.apiKey);
+      async function promptForMdlApiKey() {
+        var promptMessage = [
+          'Enter your MyDramaList API key.',
+          'The documented header name is mdl-api-key.',
+          'See https://mydramalist.github.io/MDL-API/ for the API reference.',
+          'Leave blank to remove the saved key.'
+        ].join('\n');
+
+        var response = global.prompt(promptMessage, state.mdlApiKey || '');
+        if (response === null) {
+          return;
+        }
+
+        await saveMdlApiKey(response.trim());
+      }
+
+      async function saveOmdbApiKey(value) {
+        state.omdbApiKey = value || null;
+        clearLookupCache();
+        await mergedEnv.setValue(STORAGE_KEYS.omdbApiKey, state.omdbApiKey);
         scanSoon();
+      }
+
+      async function saveMdlApiKey(value) {
+        state.mdlApiKey = value || null;
+        clearLookupCache();
+        await mergedEnv.setValue(STORAGE_KEYS.mdlApiKey, state.mdlApiKey);
+        scanSoon();
+      }
+
+      function clearLookupCache() {
+        state.cache.clear();
+        state.inFlight.clear();
+      }
+
+      function buildSetupMessage(omdbError, mdlError) {
+        if (isOmdbApiKeyError(omdbError) && isMdlApiKeyError(mdlError)) {
+          return 'Your OMDb and MyDramaList API keys need attention.';
+        }
+
+        if (isOmdbApiKeyError(omdbError)) {
+          return 'Your OMDb API key needs attention to restore IMDb and Rotten Tomatoes ratings.';
+        }
+
+        if (isMdlApiKeyError(mdlError)) {
+          return 'Your MyDramaList API key needs attention to restore MDL ratings.';
+        }
+
+        if (!hasAnyApiKey()) {
+          return 'Add an OMDb API key for IMDb and Rotten Tomatoes, and optionally a MyDramaList key for Asian drama ratings.';
+        }
+
+        return null;
+      }
+
+      function readErrorMessage(payload) {
+        if (!payload || typeof payload !== 'object') {
+          return '';
+        }
+
+        return payload.error || payload.message || payload.Error || '';
       }
 
       function isNearViewport(element) {
@@ -742,8 +1181,12 @@
           rect.top < global.innerHeight + 320;
       }
 
-      function isApiKeyError(message) {
+      function isOmdbApiKeyError(message) {
         return /api key|request limit/i.test(String(message || ''));
+      }
+
+      function isMdlApiKeyError(message) {
+        return /api key|401|403|unauthorized|forbidden|invalid/i.test(String(message || ''));
       }
 
       function textFrom(root, selector) {
@@ -768,14 +1211,17 @@
           '.nro-pill:hover { transform: translateY(-1px); border-color: rgba(255, 255, 255, 0.26); }',
           '.nro-pill-imdb { background: rgba(245, 197, 24, 0.92); color: #1b1b1b; border-color: rgba(255, 215, 79, 0.65); }',
           '.nro-pill-rt { background: rgba(250, 72, 46, 0.92); color: #fff7f5; border-color: rgba(255, 145, 130, 0.55); }',
+          '.nro-pill-mdl { background: rgba(53, 95, 214, 0.92); color: #f4f7ff; border-color: rgba(140, 175, 255, 0.55); }',
           '.nro-pill-muted { background: rgba(32, 37, 47, 0.86); color: #eef2f6; }',
           '.nro-error-note { border: 0; border-radius: 999px; padding: 6px 10px; font: 600 12px/1 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: #fff; background: rgba(50, 55, 65, 0.88); cursor: pointer; }',
-          '.nro-setup-panel { position: fixed; right: 20px; bottom: 20px; z-index: 999999; max-width: min(360px, calc(100vw - 32px)); padding: 14px 16px; border-radius: 18px; color: #fff; background: linear-gradient(135deg, rgba(19, 24, 34, 0.96), rgba(40, 9, 9, 0.96)); border: 1px solid rgba(255, 255, 255, 0.12); box-shadow: 0 18px 50px rgba(0, 0, 0, 0.45); backdrop-filter: blur(12px); }',
+          '.nro-setup-panel { position: fixed; right: 20px; bottom: 20px; z-index: 999999; max-width: min(380px, calc(100vw - 32px)); padding: 14px 16px; border-radius: 18px; color: #fff; background: linear-gradient(135deg, rgba(19, 24, 34, 0.96), rgba(40, 9, 9, 0.96)); border: 1px solid rgba(255, 255, 255, 0.12); box-shadow: 0 18px 50px rgba(0, 0, 0, 0.45); backdrop-filter: blur(12px); }',
           '.nro-setup-copy { display: flex; flex-direction: column; gap: 6px; margin-bottom: 12px; }',
           '.nro-setup-copy strong { font: 700 14px/1.2 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }',
           '.nro-setup-text { font: 500 12px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: rgba(255, 255, 255, 0.86); }',
           '.nro-setup-actions { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }',
           '.nro-setup-button { border: 0; border-radius: 999px; padding: 9px 14px; font: 700 12px/1 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: #120606; background: #e50914; cursor: pointer; }',
+          '.nro-setup-button-secondary { color: #eef3ff; background: rgba(53, 95, 214, 0.92); }',
+          '.nro-setup-links { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 10px; }',
           '.nro-setup-link { color: #fff; font: 600 12px/1.2 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; text-decoration: underline; text-underline-offset: 2px; }'
         ].join('\n');
 
@@ -784,7 +1230,8 @@
 
       return {
         init: init,
-        promptForApiKey: promptForApiKey
+        promptForOmdbApiKey: promptForOmdbApiKey,
+        promptForMdlApiKey: promptForMdlApiKey
       };
     }
 
@@ -811,11 +1258,13 @@
     return Promise.resolve();
   }
 
-  function requestJson(url) {
+  function requestJson(request) {
     return new Promise(function (resolve, reject) {
       GM_xmlhttpRequest({
-        method: 'GET',
-        url: url,
+        method: request.method || 'GET',
+        url: request.url,
+        headers: request.headers || {},
+        data: request.body || null,
         onload: function (response) {
           try {
             resolve(JSON.parse(response.responseText));

@@ -1,9 +1,22 @@
 chrome.runtime.onMessage.addListener(function handleNetflixRatingsMessage(message, sender, sendResponse) {
-  if (!message || message.type !== 'nro:request-json' || !message.url) {
+  if (!message || message.type !== 'nro:request-json') {
     return false;
   }
 
-  fetch(message.url)
+  var request = message.request || {};
+  if (!request.url) {
+    sendResponse({
+      ok: false,
+      error: 'Missing request URL.'
+    });
+    return false;
+  }
+
+  fetch(request.url, {
+    method: request.method || 'GET',
+    headers: request.headers || {},
+    body: request.body || undefined
+  })
     .then(function (response) {
       if (!response.ok) {
         throw new Error('HTTP ' + response.status);

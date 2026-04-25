@@ -1,13 +1,14 @@
 {
   "manifest_version": 3,
   "name": "Netflix Ratings Overlay",
-  "version": "0.1.0",
-  "description": "Adds IMDb and Rotten Tomatoes ratings to Netflix without removing any Netflix UI.",
+  "version": "0.2.0",
+  "description": "Adds IMDb, Rotten Tomatoes, and optional MyDramaList ratings to Netflix without removing any Netflix UI.",
   "permissions": [
     "storage"
   ],
   "host_permissions": [
-    "https://www.omdbapi.com/*"
+    "https://www.omdbapi.com/*",
+    "https://api.mydramalist.com/*"
   ],
   "background": {
     "service_worker": "src/background.js"
