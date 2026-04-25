@@ -6,8 +6,11 @@
   }
 
   var STORAGE_KEYS = {
-    omdbApiKey: 'nro.omdbApiKey'
+    omdbApiKey: 'nro.omdbApiKey',
+    cache: 'nro.omdbCacheV1'
   };
+  var CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+  var CACHE_MAX_ENTRIES = 400;
 
   var DETAIL_ROOT_SELECTOR = '.previewModal--wrapper, .previewModal--container, .jawBone, .billboard-row, main';
   var DETAIL_TITLE_SELECTOR = [
@@ -64,7 +67,8 @@
       inFlight: new Map(),
       scanTimer: null,
       observer: null,
-      setupPanel: null
+      setupPanel: null,
+      cachePersistTimer: null
     };
 
     var mergedEnv = Object.assign({
@@ -95,6 +99,7 @@
       injectStyles();
       registerMenuCommands();
       state.omdbApiKey = await mergedEnv.getValue(STORAGE_KEYS.omdbApiKey);
+      state.cache = await loadPersistentCache();
       wireNavigation();
       observeDom();
       scanSoon();
@@ -239,9 +244,9 @@
 
     async function lookupImdb(title) {
       var queryKey = normalizeComparable(title);
-
-      if (state.cache.has(queryKey)) {
-        return state.cache.get(queryKey);
+      var cached = getCachedResult(queryKey);
+      if (cached) {
+        return cached;
       }
 
       if (state.inFlight.has(queryKey)) {
@@ -260,13 +265,17 @@
             if (isApiKeyError(searchData.Error)) {
               return unavailableResult(title, searchData.Error);
             }
-            return unavailableResult(title, 'No OMDb title match was found.');
+            var noSearchMatch = unavailableResult(title, 'No OMDb title match was found.');
+            cacheResult(queryKey, noSearchMatch);
+            return noSearchMatch;
           }
 
           var candidates = Array.isArray(searchData.Search) ? searchData.Search : [];
           var bestMatch = pickBestMatch(candidates, title);
           if (!bestMatch || !bestMatch.imdbID) {
-            return unavailableResult(title, 'No close OMDb title match was found.');
+            var noBestMatch = unavailableResult(title, 'No close OMDb title match was found.');
+            cacheResult(queryKey, noBestMatch);
+            return noBestMatch;
           }
 
           var detailData = await mergedEnv.requestJson({
@@ -281,9 +290,11 @@
                 imdbUrl: 'https://www.imdb.com/title/' + encodeURIComponent(bestMatch.imdbID) + '/'
               });
             }
-            return unavailableResult(title, 'OMDb returned no IMDb rating for this title.', {
+            var noDetailRating = unavailableResult(title, 'OMDb returned no IMDb rating for this title.', {
               imdbUrl: 'https://www.imdb.com/title/' + encodeURIComponent(bestMatch.imdbID) + '/'
             });
+            cacheResult(queryKey, noDetailRating);
+            return noDetailRating;
           }
 
           var rating = detailData.imdbRating && detailData.imdbRating !== 'N/A'
@@ -298,10 +309,14 @@
             error: rating ? null : 'OMDb did not provide an IMDb rating for this title.'
           };
 
-          state.cache.set(queryKey, result);
+          cacheResult(queryKey, result);
           return result;
         } catch (error) {
-          return unavailableResult(title, error && error.message ? error.message : 'OMDb lookup failed.');
+          var failure = unavailableResult(title, error && error.message ? error.message : 'OMDb lookup failed.');
+          if (shouldPersistResult(failure)) {
+            cacheResult(queryKey, failure);
+          }
+          return failure;
         } finally {
           state.inFlight.delete(queryKey);
         }
@@ -381,6 +396,124 @@
         imdbRating: null,
         error: error
       }, seed || {});
+    }
+
+    function getCachedResult(queryKey) {
+      var entry = state.cache.get(queryKey);
+      if (!entry) {
+        return null;
+      }
+
+      if (!entry.expiresAt || entry.expiresAt <= Date.now()) {
+        state.cache.delete(queryKey);
+        scheduleCachePersist();
+        return null;
+      }
+
+      entry.updatedAt = Date.now();
+      return entry.result;
+    }
+
+    function cacheResult(queryKey, result) {
+      state.cache.set(queryKey, {
+        result: result,
+        updatedAt: Date.now(),
+        expiresAt: Date.now() + CACHE_TTL_MS
+      });
+      trimCache();
+      scheduleCachePersist();
+    }
+
+    function shouldPersistResult(result) {
+      if (!result) {
+        return false;
+      }
+
+      if (!result.error) {
+        return true;
+      }
+
+      if (isApiKeyError(result.error)) {
+        return false;
+      }
+
+      return !/lookup failed|network request failed|http\s\d+/i.test(String(result.error));
+    }
+
+    async function loadPersistentCache() {
+      var raw = await mergedEnv.getValue(STORAGE_KEYS.cache);
+      if (!raw) {
+        return new Map();
+      }
+
+      try {
+        var parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+        var entries = Array.isArray(parsed && parsed.entries) ? parsed.entries : [];
+        var nextCache = new Map();
+        var now = Date.now();
+
+        entries.forEach(function (entry) {
+          if (
+            entry &&
+            typeof entry.key === 'string' &&
+            entry.value &&
+            entry.value.result &&
+            entry.value.expiresAt > now
+          ) {
+            nextCache.set(entry.key, entry.value);
+          }
+        });
+
+        return nextCache;
+      } catch (error) {
+        log('cache load failed', error);
+        return new Map();
+      }
+    }
+
+    function scheduleCachePersist() {
+      if (state.cachePersistTimer) {
+        global.clearTimeout(state.cachePersistTimer);
+      }
+
+      state.cachePersistTimer = global.setTimeout(function () {
+        state.cachePersistTimer = null;
+        persistCache().catch(function (error) {
+          log('cache persist failed', error);
+        });
+      }, 250);
+    }
+
+    async function persistCache() {
+      trimCache();
+      var payload = {
+        entries: Array.from(state.cache.entries()).map(function (entry) {
+          return {
+            key: entry[0],
+            value: entry[1]
+          };
+        })
+      };
+      await mergedEnv.setValue(STORAGE_KEYS.cache, JSON.stringify(payload));
+    }
+
+    function trimCache() {
+      var now = Date.now();
+      Array.from(state.cache.entries()).forEach(function (entry) {
+        if (!entry[1].expiresAt || entry[1].expiresAt <= now) {
+          state.cache.delete(entry[0]);
+        }
+      });
+
+      if (state.cache.size <= CACHE_MAX_ENTRIES) {
+        return;
+      }
+
+      var ranked = Array.from(state.cache.entries()).sort(function (left, right) {
+        return (right[1].updatedAt || 0) - (left[1].updatedAt || 0);
+      });
+
+      state.cache = new Map(ranked.slice(0, CACHE_MAX_ENTRIES));
     }
 
     function ensureMount(target) {
@@ -539,6 +672,7 @@
       state.cache.clear();
       state.inFlight.clear();
       await mergedEnv.setValue(STORAGE_KEYS.omdbApiKey, state.omdbApiKey);
+      await mergedEnv.setValue(STORAGE_KEYS.cache, '');
       scanSoon();
     }
 

@@ -11,6 +11,7 @@ It does not remove any Netflix UI, and it now uses OMDb again so you only need a
 - Removes MyDramaList support.
 - Keeps the overlay limited to Netflix detail views.
 - Places the IMDb badge inline next to the title.
+- Caches title lookups locally so repeat visits do not keep spending fresh OMDb requests.
 
 ## Setup
 
@@ -46,3 +47,4 @@ You can also use the extension menu commands to set or clear the OMDb key.
 
 - OMDb matching is title-based, so remakes, alternate titles, and regional titles can still mis-match occasionally.
 - Some titles may have no IMDb rating available through OMDb.
+- The extension caches results locally for up to 7 days, including `IMDb n/a` cases, to reduce OMDb quota usage.
